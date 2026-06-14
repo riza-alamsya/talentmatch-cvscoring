@@ -1,0 +1,13 @@
+# Secrets
+.env
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Data (large / generated)
+data/chroma/
+data/cv/
+data/processed_gemini/
+shared/cv/

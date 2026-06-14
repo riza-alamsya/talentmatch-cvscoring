@@ -1,0 +1,11 @@
+fastapi==0.136.3
+uvicorn[standard]==0.49.0
+python-multipart==0.0.32
+pydantic==2.13.4
+pydantic-settings==2.14.1
+openai==2.41.0
+pymupdf==1.27.2.3
+chromadb==1.5.9
+certifi==2026.5.20
+# Local embedding option (bge-m3). torch is installed CPU-only in the Dockerfile.
+sentence-transformers==5.5.1
