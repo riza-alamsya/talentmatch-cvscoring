@@ -1,5 +1,5 @@
 """LLM provider resolver — returns an OpenAI-compatible client + model name
-for the requested provider (gemini | mimo). Clients are cached per provider."""
+for the requested provider (mimo). Clients are cached per provider."""
 from __future__ import annotations
 
 from openai import OpenAI

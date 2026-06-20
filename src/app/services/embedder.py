@@ -1,29 +1,14 @@
-"""Embedding CV chunks ke ChromaDB — multi-provider.
+"""Embedding CV chunks ke ChromaDB — local e5-small (gratis, tanpa API).
 
-Provider:
-  - gemini : API embedContent (taskType + outputDimensionality, 1536d)
-  - local  : bge-m3 via sentence-transformers (1024d, gratis tanpa limit)
-
-Tiap provider punya collection sendiri (dimensi/ruang vektor beda → TIDAK boleh
-dicampur). Vektor di-L2-normalize untuk cosine."""
+Vektor di-L2-normalize (oleh sentence-transformers) untuk cosine. Collection
+`cv_chunks_e5small` (384d)."""
 from __future__ import annotations
 
-import json
-import math
-import re
-import ssl
 import threading
-import time
-import urllib.error
-import urllib.request
 
-import certifi
 import chromadb
 
 from app.core.config import settings
-
-# Homebrew Python tidak punya CA bundle untuk SSL default urllib → pakai certifi
-_SSL_CTX = ssl.create_default_context(cafile=certifi.where())
 
 _client: chromadb.PersistentClient | None = None
 _collections: dict[str, object] = {}
@@ -48,45 +33,7 @@ def _get_collection(provider: str):
     return _collections[provider]
 
 
-def _normalize(vec: list[float]) -> list[float]:
-    norm = math.sqrt(sum(x * x for x in vec))
-    return [x / norm for x in vec] if norm else vec
-
-
-# ── Gemini embeddings (API) ───────────────────────────────────────────────────
-def _gemini_embed(text: str, task_type: str, cfg: dict, max_retries: int = 6) -> list[float]:
-    url = f"{settings.GEMINI_NATIVE_BASE_URL}/models/{cfg['model']}:embedContent"
-    payload = json.dumps({
-        "model": f"models/{cfg['model']}",
-        "content": {"parts": [{"text": text}]},
-        "taskType": task_type,
-        "outputDimensionality": cfg["dim"],
-    }).encode()
-    headers = {"Content-Type": "application/json", "x-goog-api-key": settings.GEMINI_API_KEY}
-
-    delay = 2.0
-    for attempt in range(max_retries):
-        req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=60, context=_SSL_CTX) as r:
-                data = json.loads(r.read())
-            return _normalize(data["embedding"]["values"])
-        except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8", "ignore")
-            if e.code in (429, 500, 503) and attempt < max_retries - 1:
-                m = re.search(r"retry in ([\d.]+)s", body) or re.search(r'"retryDelay":\s*"([\d.]+)s"', body)
-                time.sleep(min(float(m.group(1)) + 1 if m else delay, 60))
-                delay = min(delay * 2, 30)
-                continue
-            raise RuntimeError(f"Gemini embed gagal {e.code}: {body[:200]}")
-        except (urllib.error.URLError, TimeoutError):
-            if attempt < max_retries - 1:
-                time.sleep(delay); delay = min(delay * 2, 30); continue
-            raise
-    raise RuntimeError("Gemini embed gagal setelah semua retry")
-
-
-# ── Local embeddings (bge-m3 via sentence-transformers, lazy) ─────────────────
+# ── Local embeddings (e5-small via sentence-transformers, lazy) ───────────────
 def _get_local_model():
     global _local_model
     with _init_lock:
@@ -127,91 +74,86 @@ def preload_local() -> None:
         pass
 
 
-# ── Unified embed API ─────────────────────────────────────────────────────────
-def embed_document(text: str, provider: str) -> list[float]:
-    cfg = settings.embed_providers()[provider]
-    if cfg["type"] == "gemini":
-        return _gemini_embed(text, "RETRIEVAL_DOCUMENT", cfg)
+# ── Unified embed API (local e5-small only) ───────────────────────────────────
+def embed_document(text: str, provider: str = "local") -> list[float]:
     return _local_embed(text, is_query=False)
 
 
-def embed_query(text: str, provider: str) -> list[float]:
-    cfg = settings.embed_providers()[provider]
-    if cfg["type"] == "gemini":
-        return _gemini_embed(text, "RETRIEVAL_QUERY", cfg)
+def embed_query(text: str, provider: str = "local") -> list[float]:
     return _local_embed(text, is_query=True)
 
 
-def embed_documents(texts: list[str], provider: str) -> list[list[float]]:
-    """Batch-embed document chunks. Local runs one batched .encode (fast);
-    Gemini is per-call (its API embeds one input at a time)."""
-    cfg = settings.embed_providers()[provider]
-    if cfg["type"] == "gemini":
-        return [_gemini_embed(t, "RETRIEVAL_DOCUMENT", cfg) for t in texts]
+def embed_documents(texts: list[str], provider: str = "local") -> list[list[float]]:
+    """Batch-embed document chunks in one .encode call (fast)."""
     return _local_embed_batch(texts, is_query=False)
 
 
-# ── Chunking (provider-agnostic, defensif terhadap data jelek) ────────────────
-def cv_to_chunks(cv: dict, cv_id: str) -> list[dict]:
-    chunks: list[dict] = []
+# ── Compact chunk (1 teks per CV, hanya bagian yang relevan untuk scoring) ─────
+def cv_to_compact_chunk(cv: dict, cv_id: str) -> dict | None:
+    """Buat SATU teks padat per CV dari skills + experience key_skills + summary.
+
+    Ini yang dipakai semantic_score — education/certifications sudah dihitung
+    deterministik di scorer.py, tidak perlu masuk embedding.
+    """
     name = (cv.get("personal_info") or {}).get("name", "") if isinstance(cv.get("personal_info"), dict) else ""
-
-    def add(kind: str, text: str, **meta):
-        text = (text or "").strip()
-        if text:
-            chunks.append({
-                "id":   f"{cv_id}::{kind}::{len(chunks)}",
-                "text": text,
-                "meta": {"cv_id": cv_id, "name": name, "type": kind, **meta},
-            })
-
-    add("summary", cv.get("summary", "") if isinstance(cv.get("summary"), str) else "")
 
     sk = cv.get("skills") if isinstance(cv.get("skills"), dict) else {}
     all_skills = [s for s in ((sk.get("hard_skills") or []) + (sk.get("soft_skills") or [])) if isinstance(s, str)]
-    if all_skills:
-        add("skills", "Skills: " + ", ".join(all_skills), skills=", ".join(all_skills))
 
+    exp_skills: list[str] = []
+    roles: list[str] = []
     for e in cv.get("experience", []):
         if not isinstance(e, dict):
             continue
-        ks = ", ".join(x for x in (e.get("key_skills") or []) if isinstance(x, str))
-        txt = f'{e.get("role","")} at {e.get("company","")}. {e.get("summary","")} Skills: {ks}'
-        add("experience", txt,
-            company=e.get("company", ""), role=e.get("role", ""),
-            start_date=e.get("start_date", ""), end_date=e.get("end_date", ""),
-            is_current=bool(e.get("is_current", False)), key_skills=ks)
+        role = e.get("role", "")
+        if role:
+            roles.append(role)
+        exp_skills.extend(x for x in (e.get("key_skills") or []) if isinstance(x, str))
 
-    for ed in cv.get("education", []):
-        if not isinstance(ed, dict):
-            continue
-        add("education",
-            f'{ed.get("degree","")} in {ed.get("field_of_study","")} at {ed.get("institution","")}',
-            institution=ed.get("institution", ""))
+    # Deduplicate exp_skills agar teks tidak membengkak
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for s in exp_skills:
+        if s.lower() not in seen:
+            seen.add(s.lower())
+            deduped.append(s)
 
-    for c in cv.get("certifications", []):
-        if isinstance(c, str):
-            add("certification", c)
-        elif isinstance(c, dict):
-            add("certification", f'{c.get("name","")} - {c.get("issuer","")}', issuer=c.get("issuer", ""))
+    summary = (cv.get("summary") or "")[:300]  # max 300 char cukup
 
-    achievements = [a for a in (cv.get("achievements") or []) if isinstance(a, str)]
-    if achievements:
-        add("achievements", " ".join(achievements))
+    parts: list[str] = []
+    if summary:
+        parts.append(summary)
+    if roles:
+        parts.append("Roles: " + ", ".join(roles))
+    combined_skills = list(dict.fromkeys(all_skills + deduped))  # preserve order, dedupe
+    if combined_skills:
+        parts.append("Skills: " + ", ".join(combined_skills))
 
-    return chunks
+    text = " | ".join(parts).strip()
+    if not text:
+        return None
+
+    return {
+        "id":   f"{cv_id}::compact::0",
+        "text": text,
+        "meta": {"cv_id": cv_id, "name": name, "type": "compact"},
+    }
+
+
+# Legacy: masih dipakai test/debug
+def cv_to_chunks(cv: dict, cv_id: str) -> list[dict]:
+    chunk = cv_to_compact_chunk(cv, cv_id)
+    return [chunk] if chunk else []
 
 
 def index_cv(cv_id: str, cv: dict, provider: str) -> int:
-    """Embed semua chunk dari satu CV ke collection provider tsb. Return jumlah chunk."""
+    """Index 1 compact chunk dari satu CV. Return 1 jika berhasil, 0 jika kosong."""
     col = _get_collection(provider)
-
-    chunks = cv_to_chunks(cv, cv_id)
-    if not chunks:
+    chunk = cv_to_compact_chunk(cv, cv_id)
+    if not chunk:
         return 0
-    # Embedding (lambat, network) di luar lock; operasi Chroma (cepat) di dalam lock
-    # supaya delete+add per cv_id atomik antar thread.
-    embeddings = embed_documents([c["text"] for c in chunks], provider)  # batched for local
+
+    embedding = _local_embed(chunk["text"], is_query=False)
     with _index_lock:
         try:
             existing = col.get(where={"cv_id": cv_id})
@@ -220,10 +162,47 @@ def index_cv(cv_id: str, cv: dict, provider: str) -> int:
         except Exception:
             pass
         col.add(
-            ids=[c["id"] for c in chunks],
-            documents=[c["text"] for c in chunks],
-            embeddings=embeddings,
-            metadatas=[c["meta"] for c in chunks],
+            ids=[chunk["id"]],
+            documents=[chunk["text"]],
+            embeddings=[embedding],
+            metadatas=[chunk["meta"]],
+        )
+    return 1
+
+
+def index_cvs_batch(cv_map: dict[str, dict], provider: str) -> int:
+    """Batch-embed banyak CV sekaligus dalam satu model.encode() — jauh lebih cepat
+    untuk bulk upload (100 CV ≈ waktu 1-2 CV jika di-encode satuan).
+
+    cv_map: {cv_id: cv_dict, ...}
+    Return: jumlah CV yang berhasil diindex.
+    """
+    col = _get_collection(provider)
+    chunks = [(cv_id, cv_to_compact_chunk(cv, cv_id)) for cv_id, cv in cv_map.items()]
+    chunks = [(cid, ch) for cid, ch in chunks if ch]
+    if not chunks:
+        return 0
+
+    texts = [ch["text"] for _, ch in chunks]
+    # Satu encode call untuk semua CV — bottleneck GPU/CPU inference dibayar sekali
+    m = _get_local_model()
+    pre = _e5_prefix(is_query=False)
+    vecs = m.encode([pre + t for t in texts], normalize_embeddings=True, batch_size=64)
+
+    with _index_lock:
+        # Hapus entri lama untuk semua cv_id yang akan diindex
+        for cv_id, _ in chunks:
+            try:
+                existing = col.get(where={"cv_id": cv_id})
+                if existing["ids"]:
+                    col.delete(ids=existing["ids"])
+            except Exception:
+                pass
+        col.add(
+            ids=[ch["id"] for _, ch in chunks],
+            documents=texts,
+            embeddings=[v.tolist() for v in vecs],
+            metadatas=[ch["meta"] for _, ch in chunks],
         )
     return len(chunks)
 

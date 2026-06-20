@@ -1,4 +1,4 @@
-# TalentMatch — FastAPI scoring engine (Gemini-powered)
+# TalentMatch — FastAPI scoring engine (MiMo LLM + local e5-small embeddings)
 FROM python:3.13-slim
 
 ENV PYTHONUNBUFFERED=1 \

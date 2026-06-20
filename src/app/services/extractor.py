@@ -322,7 +322,7 @@ def extract_cv_with_retry(cv_text: str, llm_provider: str | None = None, max_ret
                 delay = min(delay * 2, 60)
             else:
                 raise
-    raise RuntimeError("Gagal setelah semua retry (rate limit / overload Gemini)")
+    raise RuntimeError("Gagal setelah semua retry (rate limit / overload LLM)")
 
 
 def extract_cv_from_pdf(pdf_path: str | Path, llm_provider: str | None = None) -> dict:

@@ -1,7 +1,9 @@
 """CV endpoints — upload, extract, list, delete."""
 from __future__ import annotations
 import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import Any
 
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
@@ -9,7 +11,7 @@ from pydantic import BaseModel
 
 from app.core.config import settings
 from app.models.schemas import CVData, ExtractResponse
-from app.services.embedder import index_cv
+from app.services.embedder import index_cv, index_cvs_batch
 from app.services.extractor import (
     extract_cv_from_pdf,
     list_processed_cvs,
@@ -27,13 +29,11 @@ router = APIRouter(prefix="/cv", tags=["CV"])
 @router.post("/upload", response_model=ExtractResponse, summary="Upload PDF & ekstrak CV")
 def upload_cv(
     file: UploadFile = File(...),
-    llm: str | None = Query(None, description="LLM provider: gemini | mimo"),
-    embed: str | None = Query(None, description="Embedding provider: gemini | local"),
+    llm: str | None = Query(None, description="LLM provider: mimo"),
+    embed: str | None = Query(None, description="Embedding provider: local"),
 ):
     """
     Upload file PDF → ekstrak struktur CV via LLM (pilih provider) → simpan + index.
-
-    - **llm**: provider ekstraksi (default dari config)
     - **embed**: provider embedding untuk index (default dari config)
     """
     llm = llm or settings.DEFAULT_LLM
@@ -69,6 +69,75 @@ def upload_cv(
     )
 
 
+class BulkUploadResult(BaseModel):
+    total: int
+    succeeded: int
+    failed: int
+    results: list[dict[str, Any]]
+
+
+@router.post("/upload-batch", response_model=BulkUploadResult,
+             summary="Upload banyak PDF sekaligus (parallel extract + batch embed)")
+def upload_cv_batch(
+    files: list[UploadFile] = File(...),
+    llm: str | None = Query(None),
+    embed: str | None = Query(None),
+):
+    """
+    Upload beberapa PDF → ekstrak paralel via LLM → index embedding sekaligus (1 encode call).
+    Jauh lebih cepat dari memanggil /upload satu-satu untuk 10+ CV.
+    """
+    llm_p = llm or settings.DEFAULT_LLM
+    embed_p = embed or settings.DEFAULT_EMBED
+
+    # Simpan semua PDF dulu
+    saved: list[tuple[str, Path]] = []
+    for f in files:
+        if not f.filename or not f.filename.endswith(".pdf"):
+            continue
+        dest = settings.CV_DIR / f.filename
+        with dest.open("wb") as out:
+            shutil.copyfileobj(f.file, out)
+        saved.append((Path(f.filename).stem, dest))
+
+    # Ekstrak paralel — tiap file blocking (LLM call), jalankan di threadpool
+    extracted: dict[str, dict] = {}
+    results: list[dict[str, Any]] = []
+
+    def _extract_one(cv_id: str, pdf_path: Path):
+        try:
+            data = extract_cv_from_pdf(pdf_path, llm_p)
+            save_processed_cv(cv_id, data)
+            return cv_id, data, None
+        except ValueError as e:
+            return cv_id, None, f"skipped: {e}"
+        except Exception as e:
+            return cv_id, None, f"error: {e}"
+
+    workers = min(len(saved), settings.MAX_CONCURRENT_EXTRACT)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futs = {pool.submit(_extract_one, cid, path): cid for cid, path in saved}
+        for fut in as_completed(futs):
+            cv_id, data, err = fut.result()
+            if err:
+                results.append({"cv_id": cv_id, "status": "failed", "message": err})
+            else:
+                extracted[cv_id] = data
+                results.append({"cv_id": cv_id, "status": "ok"})
+
+    # Batch embed semua CV yang berhasil dalam SATU encode call
+    if extracted:
+        index_cvs_batch(extracted, embed_p)
+
+    succeeded = len(extracted)
+    return BulkUploadResult(
+        total=len(saved),
+        succeeded=succeeded,
+        failed=len(saved) - succeeded,
+        results=results,
+    )
+
+
 @router.get("/", response_model=list[str], summary="Daftar semua CV yang sudah diproses")
 def list_cvs():
     return list_processed_cvs()
@@ -82,8 +151,8 @@ class ExtractByPathRequest(BaseModel):
 @router.post("/extract", response_model=ExtractResponse, summary="Ekstrak CV dari file yang sudah ada (shared storage)")
 def extract_cv_by_path(
     req: ExtractByPathRequest,
-    llm: str | None = Query(None, description="LLM provider: gemini | mimo"),
-    embed: str | None = Query(None, description="Embedding provider: gemini | local"),
+    llm: str | None = Query(None, description="LLM provider: mimo"),
+    embed: str | None = Query(None, description="Embedding provider: local"),
 ):
     """Dipanggil Java setelah ia menyimpan PDF ke shared dir. Python TIDAK menyalin
     file — cukup baca dari `path` lalu ekstrak + index."""

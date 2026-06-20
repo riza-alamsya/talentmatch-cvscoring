@@ -46,8 +46,8 @@ def score_all(
     job: JobRequest,
     with_reason: bool = Query(False, description="Generate alasan LLM per kandidat (lebih lambat)"),
     cv_ids: Optional[str] = Query(None, description="Comma-separated cv_ids. Kosong = semua CV."),
-    llm: Optional[str] = Query(None, description="LLM provider: gemini | mimo"),
-    embed: Optional[str] = Query(None, description="Embedding provider: gemini | local"),
+    llm: Optional[str] = Query(None, description="LLM provider: mimo"),
+    embed: Optional[str] = Query(None, description="Embedding provider: local"),
     lang: Optional[str] = Query(None, description="Reason output language: en | id | ms | zh"),
 ):
     """
@@ -139,8 +139,8 @@ def score_all(
 def reason_one(
     cv_id: str,
     job: JobRequest,
-    llm: Optional[str] = Query(None, description="LLM provider: gemini | mimo"),
-    embed: Optional[str] = Query(None, description="Embedding provider: gemini | local"),
+    llm: Optional[str] = Query(None, description="LLM provider: mimo"),
+    embed: Optional[str] = Query(None, description="Embedding provider: local"),
     lang: Optional[str] = Query(None, description="Reason output language: en | id | ms | zh"),
 ):
     """Generate narasi alasan untuk 1 kandidat saja terhadap job description."""

@@ -98,7 +98,7 @@ def _exp_verdict(years: Optional[float], min_years: Optional[float]) -> str:
 # ── Scoring ───────────────────────────────────────────────────────────────────
 def score_candidate(job: dict, cv_id: str, cv: dict,
                     query_embedding: Optional[list[float]] = None,
-                    embed_provider: str = "gemini") -> dict:
+                    embed_provider: str = "local") -> dict:
     cand = candidate_skills(cv)
     sk_score, matched, missing = skill_match(job.get("required_skills", []), cand)
     sem = semantic_score(query_embedding, cv_id, embed_provider)
@@ -152,7 +152,7 @@ def score_candidate(job: dict, cv_id: str, cv: dict,
     }
 
 
-def rank_candidates(job: dict, cvs: dict[str, dict], embed_provider: str = "gemini") -> list[dict]:
+def rank_candidates(job: dict, cvs: dict[str, dict], embed_provider: str = "local") -> list[dict]:
     # Embed job description SEKALI, reuse untuk semua CV (hemat panggilan API)
     desc = (job.get("description", "") or "").strip()
     query_embedding = embed_query(desc, embed_provider) if desc else None

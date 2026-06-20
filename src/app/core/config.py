@@ -17,30 +17,24 @@ class Settings(BaseSettings):
     CHROMA_DIR: Path = DATA_DIR / "chroma"
 
     # ── API keys (dari .env) ──────────────────────────────────────────────────
-    GEMINI_API_KEY: str = ""
     MIMO_API_KEY: str = ""
 
     # endpoints
-    GEMINI_OPENAI_BASE_URL: str = "https://generativelanguage.googleapis.com/v1beta/openai/"
-    GEMINI_NATIVE_BASE_URL: str = "https://generativelanguage.googleapis.com/v1beta"
     MIMO_BASE_URL: str = "https://api.xiaomimimo.com/v1"
 
     # ── Provider defaults (bisa dioverride per-request dari FE) ────────────────
-    DEFAULT_LLM: str = "gemini"      # gemini | mimo
-    DEFAULT_EMBED: str = "gemini"    # gemini | local
+    DEFAULT_LLM: str = "mimo"        # mimo
+    DEFAULT_EMBED: str = "local"     # local (e5-small)
     DEFAULT_LANG: str = "en"         # reason output language: en | id | ms | zh
 
     # Maks ekstraksi CV berjalan paralel (per worker). Pelindung diri engine:
-    # tiap ekstraksi = 1 call LLM + banyak call embedding → jaga rate limit Gemini.
+    # tiap ekstraksi = 1 call LLM + banyak call embedding → jaga rate limit.
     MAX_CONCURRENT_EXTRACT: int = 2
 
     # model names per LLM provider
-    GEMINI_LLM_MODEL: str = "gemini-2.5-flash"
     MIMO_LLM_MODEL: str = "mimo-v2.5"
 
-    # embedding params
-    GEMINI_EMBED_MODEL: str = "gemini-embedding-001"
-    GEMINI_EMBED_DIM: int = 1536
+    # embedding params (local only)
     # Small multilingual model: ~470MB, 384-dim, RAM ~600MB → fits cheap Cloud Run.
     # (e5 models REQUIRE "query:"/"passage:" prefixes — handled in embedder.)
     LOCAL_EMBED_MODEL: str = "intfloat/multilingual-e5-small"
@@ -56,12 +50,6 @@ class Settings(BaseSettings):
     # ── Registries (dipakai service layer + endpoint /providers) ───────────────
     def llm_providers(self) -> dict:
         return {
-            "gemini": {
-                "label": "Gemini 2.5 Flash",
-                "api_key": self.GEMINI_API_KEY,
-                "base_url": self.GEMINI_OPENAI_BASE_URL,
-                "model": self.GEMINI_LLM_MODEL,
-            },
             "mimo": {
                 "label": "MiMo v2.5",
                 "api_key": self.MIMO_API_KEY,
@@ -71,25 +59,16 @@ class Settings(BaseSettings):
         }
 
     def embed_providers(self) -> dict:
-        providers = {
-            "gemini": {
-                "label": "Gemini embedding (1536d)",
-                "type": "gemini",
-                "model": self.GEMINI_EMBED_MODEL,
-                "dim": self.GEMINI_EMBED_DIM,
-                "collection": "cv_chunks_gemini",
-            },
-        }
-        # Only offer local bge-m3 where there's enough RAM + the model (e.g. local dev).
-        if self.ENABLE_LOCAL_EMBED:
-            providers["local"] = {
+        # Local e5-small only — free, no external API, fits cheap Cloud Run.
+        return {
+            "local": {
                 "label": "e5-small lokal (384d)",
                 "type": "local",
                 "model": self.LOCAL_EMBED_MODEL,
                 "dim": self.LOCAL_EMBED_DIM,
                 "collection": "cv_chunks_e5small",
-            }
-        return providers
+            },
+        }
 
 
 settings = Settings()
