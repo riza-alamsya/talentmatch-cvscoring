@@ -1,8 +1,8 @@
-"""AI job-description parser — free text masuk, kebutuhan terstruktur keluar.
+"""AI job-description parser — free text in, structured requirements out.
 
-FE cukup mengirim deskripsi lowongan bebas (gaya chat); LLM yang menebak
-job title, required_skills, min pengalaman, dan pendidikan. Hasilnya dipakai
-scorer seperti biasa, jadi tidak ada form skill/title lagi di sisi user.
+FE only needs to send free-form job description (chat-style); LLM guesses
+job title, required_skills, min experience, and education. Result is used
+by scorer as usual, so no skill/title form on the user side anymore.
 """
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ RULES:
 
 
 def _coerce(data: dict) -> dict:
-    """Normalisasi deterministik atas output LLM (tipe & batas wajar)."""
+    """Deterministic normalization of LLM output (types & reasonable bounds)."""
     title = data.get("title")
     title = title.strip() if isinstance(title, str) else ""
 
@@ -65,7 +65,7 @@ def _coerce(data: dict) -> dict:
 
 def parse_job_description(description: str, llm_provider: str | None = None,
                           max_retries: int = 4) -> dict:
-    """Satu panggilan LLM → kebutuhan lowongan terstruktur, dengan retry transient."""
+    """One LLM call → structured job requirements, with transient retries."""
     client, model = get_llm(llm_provider)
     delay = 5
     last_err: Exception | None = None

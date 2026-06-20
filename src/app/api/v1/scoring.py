@@ -15,9 +15,9 @@ router = APIRouter(prefix="/score", tags=["Scoring"])
 
 
 def _autofill_job(job: JobRequest, llm: str) -> JobRequest:
-    """Free-text mode: kalau FE hanya mengirim description (tanpa skills),
-    AI mengekstrak title/skills/min pengalaman/pendidikan dari teks itu.
-    Gagal parse → lanjut dengan scoring semantik saja (jangan tumbangkan request)."""
+    """Free-text mode: if FE sends only description (no skills),
+    AI extracts title/skills/min experience/education from the text.
+    Parse failure → continue with semantic scoring only (don't fail the request)."""
     if job.required_skills or not job.description.strip():
         return job
     try:
@@ -35,44 +35,44 @@ def _autofill_job(job: JobRequest, llm: str) -> JobRequest:
     )
 
 
-# `def` (bukan async) — scoring memanggil embedding API + LLM yang blocking;
-# threadpool anyio yang menanganinya supaya event loop tidak terblok.
+# `def` (not async) — scoring calls blocking embedding API + LLM;
+# anyio threadpool handles it so event loop doesn't block.
 @router.post(
     "/",
     response_model=ScoreResponse,
-    summary="Rank semua kandidat terhadap job description",
+    summary="Rank all candidates against job description",
 )
 def score_all(
     job: JobRequest,
-    with_reason: bool = Query(False, description="Generate alasan LLM per kandidat (lebih lambat)"),
-    cv_ids: Optional[str] = Query(None, description="Comma-separated cv_ids. Kosong = semua CV."),
+    with_reason: bool = Query(False, description="Generate LLM reasoning per candidate (slower)"),
+    cv_ids: Optional[str] = Query(None, description="Comma-separated cv_ids. Empty = all CVs."),
     llm: Optional[str] = Query(None, description="LLM provider: mimo"),
     embed: Optional[str] = Query(None, description="Embedding provider: local"),
     lang: Optional[str] = Query(None, description="Reason output language: en | id | ms | zh"),
 ):
     """
-    Berikan job description → dapatkan ranking kandidat.
+    Provide job description → get candidate ranking.
 
-    - **cv_ids**: filter spesifik cv_id (comma-separated). Kalau kosong, score semua CV.
-    - **llm / embed**: pilih provider (default dari config). Ganti embed → CV otomatis di-index ulang (lazy).
-    - **lang**: bahasa narasi alasan (ikut pilihan FE; default dari config).
-    - **with_reason=true**: tambahkan narasi alasan per kandidat (LLM, lebih lambat)
+    - **cv_ids**: filter specific cv_id (comma-separated). Empty = score all CVs.
+    - **llm / embed**: choose provider (default from config). Change embed → CVs auto re-indexed (lazy).
+    - **lang**: reasoning narrative language (from FE choice; default from config).
+    - **with_reason=true**: add reasoning narrative per candidate (LLM, slower)
     """
     llm = llm or settings.DEFAULT_LLM
     embed = embed or settings.DEFAULT_EMBED
     lang = lang or settings.DEFAULT_LANG
 
-    # free-text mode: ekstrak kebutuhan dari description kalau skills kosong
+    # free-text mode: extract requirements from description if skills empty
     job = _autofill_job(job, llm)
 
-    # filter cv_ids kalau ada, otherwise semua
+    # filter cv_ids if provided, otherwise all
     if cv_ids:
         requested = [cid.strip() for cid in cv_ids.split(",") if cid.strip()]
     else:
         requested = list_processed_cvs()
 
     if not requested:
-        raise HTTPException(status_code=404, detail="Belum ada CV yang diproses.")
+        raise HTTPException(status_code=404, detail="No CVs have been processed yet.")
 
     cvs = {}
     for cv_id in requested:
@@ -83,7 +83,7 @@ def score_all(
     if not cvs:
         raise HTTPException(status_code=404, detail="Tidak ada CV valid ditemukan.")
 
-    # pastikan tiap CV ter-index di collection embedding terpilih (lazy re-index)
+    # ensure each CV is indexed in chosen embedding collection (lazy re-index)
     for cid, data in cvs.items():
         ensure_indexed(cid, data, embed)
 

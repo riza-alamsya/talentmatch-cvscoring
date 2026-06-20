@@ -22,40 +22,40 @@ from app.services.extractor import (
 router = APIRouter(prefix="/cv", tags=["CV"])
 
 
-# NOTE: endpoint berat sengaja `def` (bukan `async def`) — kerjanya blocking
-# (pymupdf, panggilan LLM/embedding yang bisa puluhan detik). FastAPI menjalankan
-# `def` di threadpool anyio, jadi event loop tetap bebas melayani request lain
-# dan beberapa ekstraksi bisa jalan paralel.
-@router.post("/upload", response_model=ExtractResponse, summary="Upload PDF & ekstrak CV")
+# NOTE: heavy endpoint is intentionally `def` (not `async def`) — its work is blocking
+# (pymupdf, LLM/embedding calls that can take tens of seconds). FastAPI runs
+# `def` in threadpool anyio, so event loop stays free to serve other requests
+# and multiple extractions can run in parallel.
+@router.post("/upload", response_model=ExtractResponse, summary="Upload PDF & extract CV")
 def upload_cv(
     file: UploadFile = File(...),
     llm: str | None = Query(None, description="LLM provider: mimo"),
     embed: str | None = Query(None, description="Embedding provider: local"),
 ):
     """
-    Upload file PDF → ekstrak struktur CV via LLM (pilih provider) → simpan + index.
-    - **embed**: provider embedding untuk index (default dari config)
+    Upload PDF file → extract CV structure via LLM (choose provider) → save + index.
+    - **embed**: embedding provider for indexing (default from config)
     """
     llm = llm or settings.DEFAULT_LLM
     embed = embed or settings.DEFAULT_EMBED
 
     if not file.filename or not file.filename.endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Hanya file PDF yang diterima.")
+        raise HTTPException(status_code=400, detail="Only PDF files accepted.")
 
     cv_id = Path(file.filename).stem
     pdf_dest = settings.CV_DIR / file.filename
 
-    # simpan PDF
+    # save PDF
     with pdf_dest.open("wb") as f:
         shutil.copyfileobj(file.file, f)
 
     try:
         data = extract_cv_from_pdf(pdf_dest, llm)
     except ValueError as e:
-        # PDF scan/gambar — tandai, jangan dikirim ke LLM
+        # Scanned/image PDF — mark, don't send to LLM
         return ExtractResponse(cv_id=cv_id, status="skipped_empty", message=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Ekstraksi gagal: {e}")
+        raise HTTPException(status_code=500, detail=f"Extraction failed: {e}")
 
     save_processed_cv(cv_id, data)
     n_chunks = index_cv(cv_id, data, embed)
@@ -64,7 +64,7 @@ def upload_cv(
     return ExtractResponse(
         cv_id=cv_id,
         status="ok",
-        message=f"Berhasil diekstrak ({llm}). {n_chunks} chunk diindex ke Chroma ({embed}).",
+        message=f"Successfully extracted ({llm}). {n_chunks} chunks indexed to Chroma ({embed}).",
         data=CVData(**data),
     )
 
@@ -77,20 +77,20 @@ class BulkUploadResult(BaseModel):
 
 
 @router.post("/upload-batch", response_model=BulkUploadResult,
-             summary="Upload banyak PDF sekaligus (parallel extract + batch embed)")
+             summary="Upload many PDFs at once (parallel extract + batch embed)")
 def upload_cv_batch(
     files: list[UploadFile] = File(...),
     llm: str | None = Query(None),
     embed: str | None = Query(None),
 ):
     """
-    Upload beberapa PDF → ekstrak paralel via LLM → index embedding sekaligus (1 encode call).
-    Jauh lebih cepat dari memanggil /upload satu-satu untuk 10+ CV.
+    Upload multiple PDFs → parallel extract via LLM → batch index embeddings (1 encode call).
+    Much faster than calling /upload one-by-one for 10+ CVs.
     """
     llm_p = llm or settings.DEFAULT_LLM
     embed_p = embed or settings.DEFAULT_EMBED
 
-    # Simpan semua PDF dulu
+    # Save all PDFs first
     saved: list[tuple[str, Path]] = []
     for f in files:
         if not f.filename or not f.filename.endswith(".pdf"):
@@ -100,7 +100,7 @@ def upload_cv_batch(
             shutil.copyfileobj(f.file, out)
         saved.append((Path(f.filename).stem, dest))
 
-    # Ekstrak paralel — tiap file blocking (LLM call), jalankan di threadpool
+    # Parallel extract — each file blocking (LLM call), run in threadpool
     extracted: dict[str, dict] = {}
     results: list[dict[str, Any]] = []
 
@@ -125,7 +125,7 @@ def upload_cv_batch(
                 extracted[cv_id] = data
                 results.append({"cv_id": cv_id, "status": "ok"})
 
-    # Batch embed semua CV yang berhasil dalam SATU encode call
+    # Batch embed all successful CVs in ONE encode call
     if extracted:
         index_cvs_batch(extracted, embed_p)
 
@@ -138,30 +138,30 @@ def upload_cv_batch(
     )
 
 
-@router.get("/", response_model=list[str], summary="Daftar semua CV yang sudah diproses")
+@router.get("/", response_model=list[str], summary="List all processed CVs")
 def list_cvs():
     return list_processed_cvs()
 
 
 class ExtractByPathRequest(BaseModel):
-    path: str                      # absolute path file PDF di shared storage
-    filename: str | None = None    # nama asli (buat nentuin cv_id)
+    path: str                      # absolute path to PDF file in shared storage
+    filename: str | None = None    # original filename (to determine cv_id)
 
 
-@router.post("/extract", response_model=ExtractResponse, summary="Ekstrak CV dari file yang sudah ada (shared storage)")
+@router.post("/extract", response_model=ExtractResponse, summary="Extract CV from existing file (shared storage)")
 def extract_cv_by_path(
     req: ExtractByPathRequest,
     llm: str | None = Query(None, description="LLM provider: mimo"),
     embed: str | None = Query(None, description="Embedding provider: local"),
 ):
-    """Dipanggil Java setelah ia menyimpan PDF ke shared dir. Python TIDAK menyalin
-    file — cukup baca dari `path` lalu ekstrak + index."""
+    """Called by Java after it saves PDF to shared dir. Python does NOT copy
+    the file — just reads from `path` then extracts + indexes."""
     llm = llm or settings.DEFAULT_LLM
     embed = embed or settings.DEFAULT_EMBED
 
     pdf_path = Path(req.path)
     if not pdf_path.exists():
-        raise HTTPException(status_code=404, detail=f"File tidak ditemukan: {req.path}")
+        raise HTTPException(status_code=404, detail=f"File not found: {req.path}")
 
     cv_id = Path(req.filename or pdf_path.name).stem
     try:
@@ -169,7 +169,7 @@ def extract_cv_by_path(
     except ValueError as e:
         return ExtractResponse(cv_id=cv_id, status="skipped_empty", message=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Ekstraksi gagal: {e}")
+        raise HTTPException(status_code=500, detail=f"Extraction failed: {e}")
 
     save_processed_cv(cv_id, data)
     n_chunks = index_cv(cv_id, data, embed)
@@ -178,40 +178,40 @@ def extract_cv_by_path(
     return ExtractResponse(
         cv_id=cv_id,
         status="ok",
-        message=f"Berhasil diekstrak ({llm}). {n_chunks} chunk diindex ({embed}).",
+        message=f"Successfully extracted ({llm}). {n_chunks} chunks indexed ({embed}).",
         data=CVData(**data),
     )
 
 
-@router.get("/{cv_id}/file", summary="Ambil file PDF asli CV (untuk ditampilkan)")
+@router.get("/{cv_id}/file", summary="Get original CV PDF file (for display)")
 def get_cv_file(cv_id: str):
-    """Kembalikan PDF asli supaya FE bisa menampilkannya (inline) buat dibandingkan."""
+    """Return original PDF so FE can display it (inline) for comparison."""
     pdfs = [p for p in settings.CV_DIR.glob(f"{cv_id}.*") if p.suffix.lower() == ".pdf"]
     if not pdfs:
-        raise HTTPException(status_code=404, detail="PDF asli tidak ditemukan.")
+        raise HTTPException(status_code=404, detail="Original PDF not found.")
     return FileResponse(
         pdfs[0],
         media_type="application/pdf",
-        content_disposition_type="inline",  # tampil di iframe, bukan download
+        content_disposition_type="inline",  # display in iframe, not download
     )
 
 
-@router.get("/{cv_id}", response_model=CVData, summary="Ambil detail CV")
+@router.get("/{cv_id}", response_model=CVData, summary="Get CV details")
 def get_cv(cv_id: str):
     data = load_processed_cv(cv_id)
     if data is None:
-        raise HTTPException(status_code=404, detail=f"CV '{cv_id}' tidak ditemukan.")
+        raise HTTPException(status_code=404, detail=f"CV '{cv_id}' not found.")
     data["cv_id"] = cv_id
     return CVData(**data)
 
 
-@router.delete("/{cv_id}", summary="Hapus CV")
+@router.delete("/{cv_id}", summary="Delete CV")
 def delete_cv(cv_id: str):
     json_path = settings.PROCESSED_DIR / f"{cv_id}.json"
     pdf_paths = list(settings.CV_DIR.glob(f"{cv_id}.*"))
 
     if not json_path.exists():
-        raise HTTPException(status_code=404, detail=f"CV '{cv_id}' tidak ditemukan.")
+        raise HTTPException(status_code=404, detail=f"CV '{cv_id}' not found.")
 
     json_path.unlink()
     for p in pdf_paths:

@@ -1,6 +1,6 @@
-"""Embedding CV chunks ke ChromaDB — local e5-small (gratis, tanpa API).
+"""Embed CV chunks to ChromaDB — local e5-small (free, no API).
 
-Vektor di-L2-normalize (oleh sentence-transformers) untuk cosine. Collection
+Vectors are L2-normalized (by sentence-transformers) for cosine similarity. Collection
 `cv_chunks_e5small` (384d)."""
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ _client: chromadb.PersistentClient | None = None
 _collections: dict[str, object] = {}
 _local_model = None
 
-# Endpoint `def` jalan paralel di threadpool → lazy init & tulis index harus diserialisasi.
+# Endpoint `def` runs in parallel in threadpool → lazy init & index writes must be serialized.
 _init_lock = threading.Lock()
 _index_lock = threading.Lock()
 
@@ -42,7 +42,7 @@ def _get_local_model():
                 from sentence_transformers import SentenceTransformer
             except ImportError as e:
                 raise RuntimeError(
-                    "Embedding lokal butuh 'sentence-transformers' (belum terpasang di image ini)."
+                    "Local embedding requires 'sentence-transformers' (not installed in this image)."
                 ) from e
             _local_model = SentenceTransformer(settings.LOCAL_EMBED_MODEL)
     return _local_model
@@ -88,12 +88,12 @@ def embed_documents(texts: list[str], provider: str = "local") -> list[list[floa
     return _local_embed_batch(texts, is_query=False)
 
 
-# ── Compact chunk (1 teks per CV, hanya bagian yang relevan untuk scoring) ─────
+# ── Compact chunk (1 text per CV, only relevant parts for scoring) ─────
 def cv_to_compact_chunk(cv: dict, cv_id: str) -> dict | None:
-    """Buat SATU teks padat per CV dari skills + experience key_skills + summary.
+    """Create ONE compact text per CV from skills + experience key_skills + summary.
 
-    Ini yang dipakai semantic_score — education/certifications sudah dihitung
-    deterministik di scorer.py, tidak perlu masuk embedding.
+    This is what semantic_score uses — education/certifications are already calculated
+    deterministically in scorer.py, no need to embed them.
     """
     name = (cv.get("personal_info") or {}).get("name", "") if isinstance(cv.get("personal_info"), dict) else ""
 
@@ -171,11 +171,11 @@ def index_cv(cv_id: str, cv: dict, provider: str) -> int:
 
 
 def index_cvs_batch(cv_map: dict[str, dict], provider: str) -> int:
-    """Batch-embed banyak CV sekaligus dalam satu model.encode() — jauh lebih cepat
-    untuk bulk upload (100 CV ≈ waktu 1-2 CV jika di-encode satuan).
+    """Batch-embed many CVs in one model.encode() call — much faster
+    for bulk uploads (100 CVs ≈ time of 1-2 CVs if encoded individually).
 
     cv_map: {cv_id: cv_dict, ...}
-    Return: jumlah CV yang berhasil diindex.
+    Return: number of CVs successfully indexed.
     """
     col = _get_collection(provider)
     chunks = [(cv_id, cv_to_compact_chunk(cv, cv_id)) for cv_id, cv in cv_map.items()]
@@ -184,13 +184,13 @@ def index_cvs_batch(cv_map: dict[str, dict], provider: str) -> int:
         return 0
 
     texts = [ch["text"] for _, ch in chunks]
-    # Satu encode call untuk semua CV — bottleneck GPU/CPU inference dibayar sekali
+    # One encode call for all CVs — GPU/CPU inference bottleneck paid once
     m = _get_local_model()
     pre = _e5_prefix(is_query=False)
     vecs = m.encode([pre + t for t in texts], normalize_embeddings=True, batch_size=64)
 
     with _index_lock:
-        # Hapus entri lama untuk semua cv_id yang akan diindex
+        # Delete old entries for all cv_ids that will be indexed
         for cv_id, _ in chunks:
             try:
                 existing = col.get(where={"cv_id": cv_id})
@@ -217,7 +217,7 @@ def is_indexed(cv_id: str, provider: str) -> bool:
 
 
 def ensure_indexed(cv_id: str, cv: dict, provider: str) -> None:
-    """Index CV ke collection provider kalau belum ada (lazy re-index saat ganti embedding)."""
+    """Index CV to provider collection if not already indexed (lazy re-index when switching embedding)."""
     if not is_indexed(cv_id, provider):
         index_cv(cv_id, cv, provider)
 

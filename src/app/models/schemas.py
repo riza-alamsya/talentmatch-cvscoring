@@ -1,4 +1,4 @@
-"""Pydantic schemas — request & response untuk semua endpoint."""
+"""Pydantic schemas — request & response for all endpoints."""
 from __future__ import annotations
 from typing import Optional
 from pydantic import BaseModel, model_validator

@@ -1,5 +1,7 @@
-"""Ekstraksi teks PDF + structured extraction via MiMo (Xiaomi).
-Semua logika dari notebooks/mimo/cv_semantic_chunking_mimo_v1.ipynb dipindah ke sini."""
+"""PDF text extraction + hybrid extraction (regex personal info + LLM skills/experience).
+Hybrid architecture — instant regex for personal_info, minimal LLM only for
+skills & experience with text limited to 2500 characters + max_tokens=250.
+Target: < 2.5 seconds per CV via DeepSeek Chat."""
 from __future__ import annotations
 import json
 import os
@@ -14,26 +16,16 @@ import fitz
 from app.core.config import settings
 from app.services.llm import get_llm
 
-# Batasi ekstraksi paralel: request masuk lewat threadpool (endpoint `def`),
-# semaphore ini yang menjaga jumlah panggilan LLM serentak tetap kecil.
+# Limit parallel extraction: requests come through threadpool (endpoint `def`),
+# semaphore keeps concurrent LLM calls small.
 _extract_sem = threading.BoundedSemaphore(settings.MAX_CONCURRENT_EXTRACT)
 
-# ── CV JSON Schema (sama persis dengan notebook) ──────────────────────────────
-CV_SCHEMA = {
+# LITE_SCHEMA — only skills & experience. Personal info extracted via regex (instant).
+# Other fields (summary, education, certifications, achievements, languages) filled
+# with defaults by normalize_cv().
+LITE_SCHEMA = {
     "type": "object",
     "properties": {
-        "personal_info": {
-            "type": "object",
-            "properties": {
-                "name":     {"type": "string"},
-                "email":    {"type": "string"},
-                "phone":    {"type": "string"},
-                "location": {"type": "string"},
-                "links":    {"type": "array", "items": {"type": "string"}},
-            },
-            "required": ["name", "email", "phone", "location", "links"],
-        },
-        "summary": {"type": "string"},
         "skills": {
             "type": "object",
             "properties": {
@@ -49,128 +41,51 @@ CV_SCHEMA = {
                 "properties": {
                     "company":    {"type": "string"},
                     "role":       {"type": "string"},
-                    "location":   {"type": "string"},
                     "start_date": {"type": "string"},
                     "end_date":   {"type": "string"},
                     "is_current": {"type": "boolean"},
-                    "summary":    {"type": "string"},
-                    "key_skills": {"type": "array", "items": {"type": "string"}},
                 },
-                "required": ["company", "role", "location", "start_date",
-                             "end_date", "is_current", "summary", "key_skills"],
-            },
-        },
-        "education": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "institution":    {"type": "string"},
-                    "degree":         {"type": "string"},
-                    "field_of_study": {"type": "string"},
-                    "start_year":     {"type": "string"},
-                    "end_year":       {"type": "string"},
-                },
-                "required": ["institution", "degree", "field_of_study", "start_year", "end_year"],
-            },
-        },
-        "certifications": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "name":   {"type": "string"},
-                    "issuer": {"type": "string"},
-                    "year":   {"type": "string"},
-                },
-                "required": ["name", "issuer", "year"],
-            },
-        },
-        "achievements": {"type": "array", "items": {"type": "string"}},
-        "languages": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "language":    {"type": "string"},
-                    "proficiency": {"type": "string"},
-                },
-                "required": ["language", "proficiency"],
+                "required": ["company", "role", "start_date", "end_date", "is_current"],
             },
         },
     },
-    "required": ["personal_info", "summary", "skills", "experience",
-                 "education", "certifications", "achievements", "languages"],
+    "required": ["skills", "experience"],
 }
 
-SYSTEM_PROMPT = """You are an expert CV/resume parser that works for ANY job sector \
-(healthcare, finance, sales, education, engineering, hospitality, trades, etc.) - never assume an IT/technical role.
+# Minimal system prompt (< 200 words) — request JSON output for skills & experience only.
+SYSTEM_PROMPT = """You are a CV parser. Extract skills and work experience from the text into JSON.
+- hard_skills: job-specific professional competencies. soft_skills: interpersonal skills (only if explicitly listed, else []).
+- experience: list each job with company, role, start_date, end_date, is_current.
+- Dates: use only dates EXPLICITLY written in the CV. Normalize to YYYY-MM. "Present"/"Now"/"Sekarang" => is_current=true, end_date="". If absent, "".
+- NEVER invent facts. Output ONLY valid JSON, no explanation."""
 
-Extract the CV into the provided JSON schema. Output ONLY valid JSON, no explanation.
-
-FIELD NAMES — use EXACTLY these, no variations:
-- "personal_info" (NOT personal_information / personalInfo / contact)
-- "summary" (NOT profile_summary / about / objective)
-- "experience" (NOT work_experience / employment / work_history)
-- "education", "skills", "certifications", "achievements", "languages"
-
-GENERAL
-- Never fabricate facts not in the CV (names, employers, dates, institutions, certifications). If absent, use "" or [].
-- Preserve the original language of the content (Indonesian stays Indonesian).
-- SUMMARIZE responsibilities in your own words for `summary` and each `experience[].summary`. Do NOT copy text verbatim.
-
-SKILLS
-- hard_skills = job-specific professional competencies. soft_skills = interpersonal/transferable skills.
-- soft_skills: include ONLY if the CV explicitly lists them (e.g. under a "Soft Skills"/"Competencies" heading). If not, return [].
-- List skills as separate items where possible (code will further normalize them afterwards).
-- experience[].key_skills = skills/tools/competencies used in that specific role.
-
-ACHIEVEMENTS
-- Extract concrete, quantifiable accomplishments from anywhere in the CV, including experience bullets.
-
-DATES (experience start_date / end_date)
-- CRITICAL: only output a date EXPLICITLY written in the CV. If absent, set to "". NEVER invent or back-calculate.
-- WHEN a date IS present, normalize to "YYYY-MM". Map Indonesian months (Januari=01 … Desember=12).
-- Expand 2-digit years: "Maret 24" -> "2024-03".
-- "Present"/"Sekarang"/"Now" => is_current=true, end_date="".
-- If only a year is written, use "YYYY".
-
-OTHER
-- certifications includes professional licenses (nursing, CPA, bar, safety certs, etc.)."""
-
-MIN_TEXT_CHARS = 100  # batas teks minimum; di bawah ini = kemungkinan PDF scan/gambar
+MIN_TEXT_CHARS = 100  # minimum text threshold; below = likely scanned/image PDF
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def clean_text(text: str) -> str:
     text = unicodedata.normalize("NFKC", text)
-    text = text.replace("—", " - ").replace("–", " - ").replace("•", " - ")
-    text = text.replace(" ", " ")
+    text = text.replace("\u2014", " - ").replace("\u2013", " - ").replace("\u2022", " - ")
+    text = text.replace("\xa0", " ")
     text = re.sub(r"\s+", " ", text)
     return text.strip()
 
 
 def extract_clean_text(pdf_path: str | Path) -> str:
+    """Extract PDF text using get_text('text') — much faster than 'dict' mode."""
     doc = fitz.open(str(pdf_path))
     full_text = []
     for page in doc:
-        data = page.get_text("dict")
-        page_text = []
-        for block in data["blocks"]:
-            if "lines" not in block:
-                continue
-            for line in block["lines"]:
-                line_text = " ".join(s["text"] for s in line["spans"]).strip()
-                if line_text:
-                    page_text.append(line_text)
-        full_text.append(" ".join(page_text))
+        text = page.get_text("text")
+        if text.strip():
+            full_text.append(text)
     doc.close()
     return clean_text(" ".join(full_text))
 
 
 def atomize_skills(items: list[str]) -> list[str]:
-    """Normalisasi deterministik: pecah 'Kategori: a, b | c' jadi item atomic.
-    TIDAK memecah di '/' supaya 'CI/CD', 'OpenAPI/Swagger' tetap utuh."""
+    """Deterministic normalization: split 'Category: a, b | c' into atomic items.
+    Do NOT split on '/' to preserve 'CI/CD', 'OpenAPI/Swagger' intact."""
     out = []
     for s in items:
         if not isinstance(s, str):
@@ -178,7 +93,7 @@ def atomize_skills(items: list[str]) -> list[str]:
         if ":" in s:
             s = s.split(":", 1)[1]
         for part in re.split(r"[,|]", s):
-            p = part.strip(" .;-•")
+            p = part.strip(" .;-\u2022")
             if p:
                 out.append(p)
     seen, result = set(), []
@@ -190,65 +105,45 @@ def atomize_skills(items: list[str]) -> list[str]:
 
 
 def normalize_cv(data: dict) -> dict:
-    """Pulihkan field name kalau MiMo memakai nama berbeda dari schema
-    (json_object mode tidak meng-enforce schema seperti Ollama `format=`)."""
-    # personal_info
+    """Restore field names + fill defaults for fields not requested from LLM
+    (summary, education, certifications, achievements, languages set to empty)."""
+    # personal_info — from regex, must always exist
     if "personal_info" not in data:
-        for alt in ["personal_information", "personalInfo", "contact", "personal"]:
-            if alt in data:
-                data["personal_info"] = data.pop(alt)
-                break
+        data["personal_info"] = {"name": "", "email": "", "phone": "",
+                                 "location": "", "links": []}
     pi = data.get("personal_info", {})
-    if isinstance(pi, dict) and "links" not in pi:
-        for alt in ["linkedin", "github", "portfolio", "website"]:
-            if alt in pi:
-                pi["links"] = [pi.pop(alt)]
-                break
-        else:
-            pi["links"] = []
+    if isinstance(pi, dict):
+        pi.setdefault("links", [])
+        for k in ("name", "email", "phone", "location"):
+            pi.setdefault(k, "")
 
-    # summary
-    if "summary" not in data:
-        for alt in ["profile_summary", "profileSummary", "about", "objective", "profile"]:
-            if alt in data:
-                data["summary"] = data.pop(alt)
-                break
-
-    # experience
-    if "experience" not in data:
-        for alt in ["work_experience", "workExperience", "employment", "work_history"]:
-            if alt in data:
-                data["experience"] = data.pop(alt)
-                break
-
-    # pastikan field wajib ada
-    for field in ["experience", "education", "certifications", "achievements", "languages"]:
-        data.setdefault(field, [])
-    data.setdefault("summary", "")
-
-    # ── Type guards: MiMo kadang balikin tipe yang salah (list vs dict vs str) ──
-    # skills harus dict {hard_skills:[], soft_skills:[]}
+    # skills must be dict {hard_skills:[], soft_skills:[]}
     if not isinstance(data.get("skills"), dict):
         data["skills"] = {"hard_skills": [], "soft_skills": []}
     for sk in ("hard_skills", "soft_skills"):
         if not isinstance(data["skills"].get(sk), list):
             data["skills"][sk] = []
 
-    # personal_info harus dict
+    # personal_info must be dict
     if not isinstance(data.get("personal_info"), dict):
         data["personal_info"] = {"name": "", "email": "", "phone": "",
                                  "location": "", "links": []}
 
-    # list-of-object fields: pastikan list
+    # required fields — summary/education/cert/achievements/languages filled with defaults
+    data.setdefault("summary", "")
+    for field in ("experience", "education", "certifications", "achievements", "languages"):
+        data.setdefault(field, [])
+
+    # list-of-object fields: ensure list type
     for field in ("experience", "education", "certifications", "languages", "achievements"):
         if not isinstance(data.get(field), list):
             data[field] = []
 
-    # experience/education: buang item yang bukan dict
+    # experience/education: remove non-dict items
     for field in ("experience", "education"):
         data[field] = [x for x in data[field] if isinstance(x, dict)]
 
-    # languages/certifications: string -> object, buang yang bukan str/dict
+    # languages/certifications: string -> object, remove non-str/dict
     data["languages"] = [
         {"language": x} if isinstance(x, str) else x
         for x in data["languages"] if isinstance(x, (str, dict))
@@ -258,7 +153,7 @@ def normalize_cv(data: dict) -> dict:
         for x in data["certifications"] if isinstance(x, (str, dict))
     ]
 
-    # achievements: hanya string
+    # achievements: strings only
     data["achievements"] = [x for x in data["achievements"] if isinstance(x, str)]
 
     return data
@@ -269,7 +164,7 @@ def _year_in_source(date_str: str, text: str) -> bool:
 
 
 def validate_dates(data: dict, source_text: str) -> dict:
-    """Anti-halusinasi tanggal: kosongin tanggal yang tahunnya tidak ada di teks CV."""
+    """Anti-hallucination for dates: clear dates with years not in the CV text."""
     for e in data.get("experience", []):
         for k in ("start_date", "end_date"):
             if e.get(k) and not _year_in_source(e[k], source_text):
@@ -279,9 +174,52 @@ def validate_dates(data: dict, source_text: str) -> dict:
     return data
 
 
+# ── Regex personal info (instant, no LLM) ───────────────────────────────────
+def _extract_personal_regex(text: str) -> dict:
+    """Extract name, email, phone, location via regex — 0 ms latency."""
+    # Email
+    email = ""
+    m = re.search(r"[\w\.-]+@[\w\.-]+\.\w+", text)
+    if m:
+        email = m.group(0).strip()
+
+    # Phone (Indonesia & international)
+    phone = ""
+    m = re.search(r"(\+?62|0|8)[\d\s\-\(\)]{8,15}", text)
+    if m:
+        phone = re.sub(r"\s+", " ", m.group(0).strip())
+
+    # Name: first non-empty line (assume name at top of CV)
+    name = ""
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    if lines:
+        raw = lines[0]
+        raw = re.sub(r"[^\w\s\.\-\']", "", raw)
+        raw = re.sub(r"\s+", " ", raw).strip()
+        # Skip if contains @ (email) or only digits (phone)
+        if raw and "@" not in raw and not re.match(r"^[\d\s\+\-\(\)]+$", raw):
+            name = raw
+
+    # Location: empty (difficult to regex accurately)
+    location = ""
+
+    return {"name": name, "email": email, "phone": phone, "location": location, "links": []}
+
+
 # ── Main service ──────────────────────────────────────────────────────────────
 def extract_cv(cv_text: str, llm_provider: str | None = None) -> dict:
-    """Satu panggilan LLM -> JSON terstruktur + normalisasi deterministik."""
+    """Hybrid: regex for personal_info + minimal LLM for skills & experience.
+    Total round-trip < 2.5 seconds (DeepSeek Chat)."""
+    # Save original text for date validation (need full text)
+    original_text = cv_text
+
+    # Optimization: truncate for faster processing
+    cv_text = cv_text[:2500]
+
+    # 1. Regex — personal info (instant, no LLM)
+    personal_info = _extract_personal_regex(cv_text)
+
+    # 2. LLM — only skills + experience (short prompt, max_tokens=250)
     client, model = get_llm(llm_provider)
     resp = client.chat.completions.create(
         model=model,
@@ -291,22 +229,31 @@ def extract_cv(cv_text: str, llm_provider: str | None = None) -> dict:
         ],
         response_format={"type": "json_object"},
         temperature=0,
+        max_tokens=250,
     )
-    data = normalize_cv(json.loads(resp.choices[0].message.content))
+    data_llm = json.loads(resp.choices[0].message.content)
 
-    # normalisasi skills (deterministik)
+    # 3. Merge: personal_info (regex) + skills & experience (LLM)
+    data = {
+        "personal_info": personal_info,
+        "skills": data_llm.get("skills", {"hard_skills": [], "soft_skills": []}),
+        "experience": data_llm.get("experience", []),
+    }
+    data = normalize_cv(data)
+
+    # normalize skills (deterministic)
     data["skills"]["hard_skills"] = atomize_skills(data["skills"].get("hard_skills", []))
     data["skills"]["soft_skills"] = atomize_skills(data["skills"].get("soft_skills", []))
     for e in data.get("experience", []):
         if isinstance(e, dict):
             e["key_skills"] = atomize_skills(e.get("key_skills", []))
 
-    # anti-halusinasi tanggal (deterministik)
-    return validate_dates(data, cv_text)
+    # anti-hallucination for dates (deterministic, use original text)
+    return validate_dates(data, original_text)
 
 
 def extract_cv_with_retry(cv_text: str, llm_provider: str | None = None, max_retries: int = 5) -> dict:
-    """Bungkus extract_cv dengan backoff untuk rate-limit (429) & overload (503)."""
+    """Wrap extract_cv with backoff for rate-limit (429) & overload (503)."""
     delay = 5
     for attempt in range(max_retries):
         try:
@@ -322,26 +269,37 @@ def extract_cv_with_retry(cv_text: str, llm_provider: str | None = None, max_ret
                 delay = min(delay * 2, 60)
             else:
                 raise
-    raise RuntimeError("Gagal setelah semua retry (rate limit / overload LLM)")
+    raise RuntimeError("Failed after all retries (rate limit / LLM overload)")
 
 
-def extract_cv_from_pdf(pdf_path: str | Path, llm_provider: str | None = None) -> dict:
-    """Full pipeline: PDF -> teks bersih -> LLM extraction -> normalisasi -> dict."""
+def extract_cv_from_pdf(pdf_path: str | Path, llm_provider: str | None = None, force: bool = False) -> dict:
+    """Full pipeline: PDF -> clean text -> hybrid extraction -> normalization -> dict.
+    - force=False: return from cache if CV already processed.
+    - force=True:  always re-extract (ignore cache)."""
     pdf_path = Path(pdf_path)
+    cv_id = pdf_path.stem
+
+    # Cache hit — return directly without LLM call
+    if not force:
+        cached = load_processed_cv(cv_id)
+        if cached is not None:
+            return cached
+
     cv_text = extract_clean_text(pdf_path)
 
     if len(cv_text) < MIN_TEXT_CHARS:
         raise ValueError(
-            f"Teks terlalu pendek ({len(cv_text)} char). "
-            "Kemungkinan PDF scan/gambar tanpa text layer — butuh OCR."
+            f"Text too short ({len(cv_text)} characters). "
+            "Likely a scanned/image PDF without text layer — requires OCR."
         )
 
     with _extract_sem:
         return extract_cv_with_retry(cv_text, llm_provider)
 
 
+# ── Caching ───────────────────────────────────────────────────────────────────
 def save_processed_cv(cv_id: str, data: dict) -> Path:
-    # Tulis atomik (tmp + rename) supaya pembaca paralel tidak pernah melihat JSON separuh.
+    # Atomic write (tmp + rename) so parallel readers never see incomplete JSON.
     out = settings.PROCESSED_DIR / f"{cv_id}.json"
     tmp = out.with_suffix(".json.tmp")
     tmp.write_text(

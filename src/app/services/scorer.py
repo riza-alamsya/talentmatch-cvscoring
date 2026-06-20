@@ -167,25 +167,25 @@ def rank_candidates(job: dict, cvs: dict[str, dict], embed_provider: str = "loca
 
 # ── LLM Reasoning ─────────────────────────────────────────────────────────────
 REASON_SYSTEM = (
-    "Tugasmu menjelaskan alasan skor kecocokan kandidat terhadap lowongan. "
-    "WAJIB hanya memakai fakta di bagian DATA. DILARANG KERAS mengarang skill, perusahaan, "
-    "proyek, angka, atau klaim yang tidak ada di DATA.\n"
-    "ATURAN KETAT:\n"
-    "- KEKUATAN: sebut skill dari SKILL COCOK + pengalaman nyata dari RIWAYAT.\n"
-    "- KEKURANGAN: HANYA boleh menyebut item yang tertulis di SKILL KURANG, dan/atau jika "
-    "MEMENUHI MIN PENGALAMAN = TIDAK. JANGAN menyebut skill di SKILL COCOK sebagai kekurangan.\n"
-    "- PENGALAMAN: pakai field 'MEMENUHI MIN PENGALAMAN' apa adanya. JANGAN hitung sendiri.\n"
-    "- Jika SKILL KURANG '-' dan MEMENUHI MIN PENGALAMAN = YA: nyatakan semua syarat terpenuhi.\n"
-    "- Jika pengalaman 'tidak diketahui': tulis lama pengalaman tidak tercantum di CV."
+    "Your task is to explain the reasoning behind the candidate's match score for the job. "
+    "MUST only use facts in the DATA section. ABSOLUTELY FORBIDDEN to invent skills, companies, "
+    "projects, numbers, or claims not in DATA.\n"
+    "STRICT RULES:\n"
+    "- STRENGTHS: mention skills from MATCHED SKILLS + real experience from HISTORY.\n"
+    "- WEAKNESSES: ONLY mention items listed in MISSING SKILLS, and/or if "
+    "MEETS MIN EXPERIENCE = NO. DO NOT mention skills in MATCHED SKILLS as weaknesses.\n"
+    "- EXPERIENCE: use the 'MEETS MIN EXPERIENCE' field as-is. DO NOT calculate yourself.\n"
+    "- If MISSING SKILLS '-' and MEETS MIN EXPERIENCE = YES: state all requirements are met.\n"
+    "- If experience 'unknown': write that work duration is not listed in the CV."
 )
 
-# Output-language directive — appended to the system prompt so the reason text
-# matches the language selected in the FE (id | en | ms | zh).
+# Output-language directive — appended to system prompt so reason text
+# matches language selected in FE (id | en | ms | zh).
 _LANG_DIRECTIVE = {
-    "id": "Jawab dalam 2-3 kalimat Bahasa Indonesia yang ringkas. Tulis HANYA dalam Bahasa Indonesia.",
+    "id": "Answer in 2-3 concise sentences in Indonesian. Write ONLY in Indonesian.",
     "en": "Answer in 2-3 concise sentences. Write your reply in English ONLY.",
-    "ms": "Jawab dalam 2-3 ayat Bahasa Melayu yang ringkas. Tulis HANYA dalam Bahasa Melayu.",
-    "zh": "用简体中文回答，2-3 句话，简洁。只能用简体中文作答。",
+    "ms": "Answer in 2-3 concise sentences in Malay. Write ONLY in Malay.",
+    "zh": "Answer in 2-3 concise sentences in Simplified Chinese. Write ONLY in Simplified Chinese.",
 }
 
 
@@ -197,53 +197,26 @@ def _lang_directive(lang: str | None) -> str:
 
 def generate_reason(result: dict, cv: dict, job: dict, llm_provider: str | None = None,
                     lang: str | None = None) -> str:
-    riwayat = "\n".join(
-        f'- {e.get("role","")} @ {e.get("company","")}: {e.get("summary","")}'
-        for e in cv.get("experience", [])
-    ) or "- (tidak ada)"
-
-    yrs_str = f'{result["years"]} th' if result["years"] is not None else "tidak diketahui"
-    verdict = _exp_verdict(result["years"], job.get("min_years_experience"))
-
-    data_block = (
-        f'KANDIDAT: {result["name"]}\n'
-        f'SKOR: {result["final_score"]}/100\n'
-        f'SKILL COCOK: {", ".join(result["matched"]) or "-"}\n'
-        f'SKILL KURANG (vs lowongan): {", ".join(result["missing"]) or "-"}\n'
-        f'PENGALAMAN: {yrs_str}\n'
-        f'MEMENUHI MIN PENGALAMAN: {verdict}\n'
-        f'RINGKASAN CV: {cv.get("summary","")}\n'
-        f'RIWAYAT KERJA:\n{riwayat}'
-    )
-    user_msg = (
-        f'LOWONGAN: {job["title"]} | butuh skill: {", ".join(job.get("required_skills", []))}'
-        f' | min pengalaman: {job.get("min_years_experience", "-")} th\n\n'
-        f'DATA:\n{data_block}'
-    )
-    system_msg = REASON_SYSTEM + "\n" + _lang_directive(lang)
-    client, model = get_llm(llm_provider)
-    delay = 5
-    last_err: Exception | None = None
-    for attempt in range(5):
-        try:
-            resp = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": system_msg},
-                    {"role": "user",   "content": user_msg},
-                ],
-                temperature=0,
-            )
-            return resp.choices[0].message.content.strip()
-        except Exception as e:  # noqa: BLE001
-            msg = str(e); last_err = e
-            transient = ("429" in msg or "RESOURCE_EXHAUSTED" in msg
-                         or "503" in msg or "UNAVAILABLE" in msg or "overloaded" in msg)
-            if transient and attempt < 4:
-                m = re.search(r"(\d+(?:\.\d+)?)s", msg)
-                wait = (float(m.group(1)) + 2) if m else delay
-                time.sleep(min(wait, 60))
-                delay = min(delay * 2, 60)
-            else:
-                raise
-    raise last_err  # type: ignore[misc]
+    # Ambil data dari hasil scoring yang sudah dihitung
+    matched = result.get("matched", [])
+    missing = result.get("missing", [])
+    final_score = result.get("final_score", 0)
+    exp_verdict = _exp_verdict(result["years"], job.get("min_years_experience"))
+    
+    # 1. Kalimat Kekuatan
+    if matched:
+        strength = f"Kandidat memiliki skill yang sesuai: {', '.join(matched[:3])}."
+    else:
+        strength = "Tidak ada skill yang spesifik cocok secara langsung."
+        
+    # 2. Kalimat Kekurangan
+    if missing:
+        weakness = f"Namun, kandidat belum memiliki skill: {', '.join(missing[:3])}."
+    else:
+        weakness = "Kandidat memenuhi semua persyaratan skill yang dibutuhkan."
+        
+    # 3. Kalimat Pengalaman
+    exp_note = f"Pengalaman: {exp_verdict}."
+    
+    # Gabungkan (sesuai permintaan 2-3 kalimat)
+    return f"{strength} {weakness} {exp_note} Skor akhir: {final_score}/100."

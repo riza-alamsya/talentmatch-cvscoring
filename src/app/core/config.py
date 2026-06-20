@@ -18,21 +18,26 @@ class Settings(BaseSettings):
 
     # ── API keys (dari .env) ──────────────────────────────────────────────────
     MIMO_API_KEY: str = ""
+    GEMINI_API_KEY: str = ""
+    DEEPSEEK_API_KEY: str = ""
 
     # endpoints
     MIMO_BASE_URL: str = "https://api.xiaomimimo.com/v1"
+    GEMINI_BASE_URL: str = "https://generativelanguage.googleapis.com/v1beta/openai/"
+    DEEPSEEK_BASE_URL: str = "https://api.deepseek.com/v1"
 
     # ── Provider defaults (bisa dioverride per-request dari FE) ────────────────
-    DEFAULT_LLM: str = "mimo"        # mimo
-    DEFAULT_EMBED: str = "local"     # local (e5-small)
-    DEFAULT_LANG: str = "en"         # reason output language: en | id | ms | zh
+    DEFAULT_LLM: str = "deepseek"       # deepseek | gemini-flash | mimo
+    DEFAULT_EMBED: str = "local"        # local (e5-small)
+    DEFAULT_LANG: str = "en"            # reason output language: en | id | ms | zh
 
-    # Maks ekstraksi CV berjalan paralel (per worker). Pelindung diri engine:
-    # tiap ekstraksi = 1 call LLM + banyak call embedding → jaga rate limit.
-    MAX_CONCURRENT_EXTRACT: int = 2
+    # Maks ekstraksi CV berjalan paralel (per worker).
+    MAX_CONCURRENT_EXTRACT: int = 10
 
     # model names per LLM provider
     MIMO_LLM_MODEL: str = "mimo-v2.5"
+    GEMINI_FLASH_MODEL: str = "gemini-2.0-flash-lite"
+    DEEPSEEK_MODEL: str = "deepseek-chat"
 
     # embedding params (local only)
     # Small multilingual model: ~470MB, 384-dim, RAM ~600MB → fits cheap Cloud Run.
@@ -50,6 +55,18 @@ class Settings(BaseSettings):
     # ── Registries (dipakai service layer + endpoint /providers) ───────────────
     def llm_providers(self) -> dict:
         return {
+            "deepseek": {
+                "label": "DeepSeek Chat",
+                "api_key": self.DEEPSEEK_API_KEY,
+                "base_url": self.DEEPSEEK_BASE_URL,
+                "model": self.DEEPSEEK_MODEL,
+            },
+            "gemini-flash": {
+                "label": "Gemini 2.0 Flash Lite",
+                "api_key": self.GEMINI_API_KEY,
+                "base_url": self.GEMINI_BASE_URL,
+                "model": self.GEMINI_FLASH_MODEL,
+            },
             "mimo": {
                 "label": "MiMo v2.5",
                 "api_key": self.MIMO_API_KEY,
